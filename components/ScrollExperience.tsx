@@ -1,16 +1,43 @@
 "use client";
 
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import gsap from "gsap";
 import { ScrollTrigger } from "gsap/ScrollTrigger";
 import { SCENES } from "@/data/scenes";
+import { createFrameStore } from "@/lib/frameStore";
 import { ChevronRight, Layers, Compass, Sparkles, ChevronDown } from "lucide-react";
 
 if (typeof window !== "undefined") {
   gsap.registerPlugin(ScrollTrigger);
 }
 
-const TOTAL_FRAMES_PER_SCENE = 190;
+const TOTAL_FRAMES = SCENES.reduce((sum, scene) => sum + scene.frameCount, 0);
+// Native size of the frame files. A canvas denser than this adds cost, not detail.
+const FRAME_WIDTH = 1280;
+const FRAME_HEIGHT = 720;
+const SCRUB_SECONDS = 0.5;
+
+const getFrameUrl = (folder: string, frameNumber: number) =>
+  `/frames/${folder}/frame_${String(frameNumber).padStart(3, "0")}.webp`;
+
+// Which scene a global frame index falls in.
+const getSceneIndex = (frame: number) => {
+  let remaining = frame;
+  for (let i = 0; i < SCENES.length; i++) {
+    if (remaining < SCENES[i].frameCount) return i;
+    remaining -= SCENES[i].frameCount;
+  }
+  return SCENES.length - 1;
+};
+
+// Decoded frames take about 3.7 MB each, so low-memory and touch devices keep fewer.
+const getDecodeWindowSize = () => {
+  const memory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
+  const constrained =
+    (memory !== undefined && memory <= 4) ||
+    window.matchMedia("(pointer: coarse)").matches;
+  return constrained ? 24 : 48;
+};
 
 export function ScrollExperience() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -21,210 +48,112 @@ export function ScrollExperience() {
   const [isReady, setIsReady] = useState(false);
   const [scrollStarted, setScrollStarted] = useState(false);
 
-  // Cached image maps: folder -> HTMLImageElement[]
-  const imageCacheRef = useRef<Map<string, HTMLImageElement[]>>(new Map());
-  const currentSceneRef = useRef(0);
-  const currentFrameRef = useRef(1);
-
-  // Helper to format frame path: frame_001.webp ... frame_190.webp
-  const getFrameUrl = useCallback((folder: string, frameNumber: number) => {
-    const pad = String(frameNumber).padStart(3, "0");
-    return `/frames/${folder}/frame_${pad}.webp`;
-  }, []);
-
-  // Draw current frame on canvas keeping aspect-ratio cover
-  const drawFrame = useCallback((folder: string, frameIndex: number) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    const sceneImages = imageCacheRef.current.get(folder);
-    const img = sceneImages?.[frameIndex - 1];
-
-    if (!img || !img.complete || img.naturalWidth === 0) return;
-
-    const cWidth = canvas.width;
-    const cHeight = canvas.height;
-    const imgWidth = img.naturalWidth;
-    const imgHeight = img.naturalHeight;
-
-    // Cover calculation
-    const hRatio = cWidth / imgWidth;
-    const vRatio = cHeight / imgHeight;
-    const ratio = Math.max(hRatio, vRatio);
-
-    const centerShiftX = (cWidth - imgWidth * ratio) / 2;
-    const centerShiftY = (cHeight - imgHeight * ratio) / 2;
-
-    ctx.clearRect(0, 0, cWidth, cHeight);
-    ctx.drawImage(
-      img,
-      0,
-      0,
-      imgWidth,
-      imgHeight,
-      centerShiftX,
-      centerShiftY,
-      imgWidth * ratio,
-      imgHeight * ratio
-    );
-  }, []);
-
-  // Canvas resize handler (high DPI support)
+  // Frame loading, canvas drawing and the scroll timeline
   useEffect(() => {
+    const container = containerRef.current;
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    const ctx = canvas?.getContext("2d", { alpha: false });
+    if (!container || !canvas || !ctx) return;
 
-    const handleResize = () => {
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = window.innerWidth * dpr;
-      canvas.height = window.innerHeight * dpr;
-      canvas.style.width = `${window.innerWidth}px`;
-      canvas.style.height = `${window.innerHeight}px`;
+    let targetFrame = 0;
+    let drawnBitmap: ImageBitmap | null = null;
+    let drawRequest = 0;
 
-      const ctx = canvas.getContext("2d");
-      if (ctx) {
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = "high";
-      }
-
-      const activeScene = SCENES[currentSceneRef.current];
-      if (activeScene) {
-        drawFrame(activeScene.folder, currentFrameRef.current);
-      }
-    };
-
-    handleResize();
-    window.addEventListener("resize", handleResize);
-    return () => window.removeEventListener("resize", handleResize);
-  }, [drawFrame]);
-
-  // Preload frames strategy: First load crucial frames of rolling (Scene 1)
-  useEffect(() => {
-    let isCancelled = false;
-
-    SCENES.forEach((scene) => {
-      if (!imageCacheRef.current.has(scene.folder)) {
-        imageCacheRef.current.set(scene.folder, new Array(scene.frameCount));
-      }
+    const store = createFrameStore({
+      scenes: SCENES,
+      getUrl: getFrameUrl,
+      windowSize: getDecodeWindowSize(),
+      // Decodes finish in bursts, so draw at most once per screen refresh.
+      onDecoded: () => {
+        if (drawRequest) return;
+        drawRequest = requestAnimationFrame(() => {
+          drawRequest = 0;
+          draw();
+        });
+      },
+      onProgress: (percent, ready) => {
+        setLoadProgress(percent);
+        if (ready) setIsReady(true);
+      },
     });
 
-    const loadImage = (folder: string, index: number): Promise<void> => {
-      return new Promise((resolve) => {
-        const cached = imageCacheRef.current.get(folder)?.[index - 1];
-        if (cached && cached.complete) {
-          resolve();
-          return;
-        }
+    // Draws the best available frame, cover-fitted. Skips repeat draws.
+    function draw() {
+      if (!canvas || !ctx) return;
+      const nearest = store.getNearest(targetFrame);
+      if (!nearest || nearest.bitmap === drawnBitmap) return;
+      const { bitmap } = nearest;
+      const ratio = Math.max(canvas.width / bitmap.width, canvas.height / bitmap.height);
+      const width = bitmap.width * ratio;
+      const height = bitmap.height * ratio;
+      ctx.drawImage(
+        bitmap,
+        (canvas.width - width) / 2,
+        (canvas.height - height) / 2,
+        width,
+        height
+      );
+      drawnBitmap = bitmap;
+    }
 
-        const img = new Image();
-        img.src = getFrameUrl(folder, index);
-        img.onload = () => {
-          if (!isCancelled) {
-            const arr = imageCacheRef.current.get(folder);
-            if (arr) arr[index - 1] = img;
+    // The CSS size comes from the layout; only the backing store is set here.
+    const resize = () => {
+      const { clientWidth, clientHeight } = canvas;
+      if (!clientWidth || !clientHeight) return;
+      // Backing pixels per CSS pixel at which a covering frame is drawn 1:1.
+      const sourceDensity =
+        1 / Math.max(clientWidth / FRAME_WIDTH, clientHeight / FRAME_HEIGHT);
+      const density = Math.min(window.devicePixelRatio || 1, sourceDensity);
+      const width = Math.round(clientWidth * density);
+      const height = Math.round(clientHeight * density);
+      if (width === canvas.width && height === canvas.height) return;
+      canvas.width = width;
+      canvas.height = height;
+      drawnBitmap = null; // resizing clears the canvas
+      draw();
+    };
+    const resizeObserver = new ResizeObserver(resize);
+    resizeObserver.observe(canvas);
+    resize();
+    store.start();
+
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    // `scrub` eases this tween toward the scroll position, so a wheel notch plays
+    // through the frames in between. GSAP updates it once per screen refresh.
+    const gsapContext = gsap.context(() => {
+      const playback = { frame: 0 };
+      gsap.to(playback, {
+        frame: TOTAL_FRAMES - 1,
+        ease: "none",
+        scrollTrigger: {
+          trigger: container,
+          start: "top top",
+          end: `+=${SCENES.length * 180}%`,
+          pin: true,
+          scrub: reduceMotion ? true : SCRUB_SECONDS,
+          anticipatePin: 1,
+        },
+        onUpdate: () => {
+          const frame = Math.round(playback.frame);
+          setScrollStarted(frame > TOTAL_FRAMES * 0.02);
+          setActiveSceneIndex(getSceneIndex(frame));
+          if (frame !== targetFrame) {
+            targetFrame = frame;
+            store.setPlayhead(frame);
           }
-          resolve();
-        };
-        img.onerror = () => {
-          resolve();
-        };
+          draw();
+        },
       });
-    };
-
-    const preloadAll = async () => {
-      // Step 1: Preload initial 25 frames of Scene 0 (rolling) for immediate hero display
-      const initialPromises: Promise<void>[] = [];
-      for (let i = 1; i <= Math.min(25, SCENES[0].frameCount); i++) {
-        initialPromises.push(loadImage(SCENES[0].folder, i));
-      }
-      await Promise.all(initialPromises);
-
-      if (isCancelled) return;
-      setIsReady(true);
-      setLoadProgress(30);
-
-      // Immediately render frame 1 of rolling on the hero
-      drawFrame(SCENES[0].folder, 1);
-
-      // Step 2: Background preload all scene frame 1s
-      for (const scene of SCENES) {
-        await loadImage(scene.folder, 1);
-      }
-
-      // Step 3: Progressively stream the rest
-      let loadedCount = 25;
-      const totalEstimated = SCENES.length * TOTAL_FRAMES_PER_SCENE;
-
-      for (let s = 0; s < SCENES.length; s++) {
-        const scene = SCENES[s];
-        const startFrame = s === 0 ? 26 : 2;
-        const batchSize = 10;
-
-        for (let f = startFrame; f <= scene.frameCount; f += batchSize) {
-          if (isCancelled) return;
-          const batch: Promise<void>[] = [];
-          for (let b = 0; b < batchSize && f + b <= scene.frameCount; b++) {
-            batch.push(loadImage(scene.folder, f + b));
-          }
-          await Promise.all(batch);
-          loadedCount += batch.length;
-          setLoadProgress(Math.min(100, Math.round((loadedCount / totalEstimated) * 100)));
-        }
-      }
-    };
-
-    preloadAll();
+    }, container);
 
     return () => {
-      isCancelled = true;
+      gsapContext.revert();
+      resizeObserver.disconnect();
+      cancelAnimationFrame(drawRequest);
+      store.destroy();
     };
-  }, [drawFrame, getFrameUrl]);
-
-  // GSAP ScrollTrigger timeline configuration
-  useEffect(() => {
-    if (!isReady || !containerRef.current) return;
-
-    const ctx = gsap.context(() => {
-      const totalScenes = SCENES.length;
-
-      ScrollTrigger.create({
-        trigger: containerRef.current,
-        start: "top top",
-        end: `+=${totalScenes * 180}%`,
-        pin: true,
-        scrub: 0.6,
-        anticipatePin: 1,
-        onUpdate: (self) => {
-          const progress = self.progress; // 0 to 1
-          setScrollStarted(progress > 0.02);
-
-          const totalProgress = progress * totalScenes;
-          let sceneIdx = Math.floor(totalProgress);
-          if (sceneIdx >= totalScenes) sceneIdx = totalScenes - 1;
-
-          const sceneFraction = totalProgress - sceneIdx;
-          const frameIndex = Math.min(
-            TOTAL_FRAMES_PER_SCENE,
-            Math.max(1, Math.floor(sceneFraction * TOTAL_FRAMES_PER_SCENE) + 1)
-          );
-
-          currentSceneRef.current = sceneIdx;
-          currentFrameRef.current = frameIndex;
-
-          const currentScene = SCENES[sceneIdx];
-          if (currentScene) {
-            drawFrame(currentScene.folder, frameIndex);
-          }
-
-          setActiveSceneIndex(sceneIdx);
-        }
-      });
-    }, containerRef);
-
-    return () => ctx.revert();
-  }, [isReady, drawFrame]);
+  }, []);
 
   const activeScene = SCENES[activeSceneIndex];
 
@@ -238,7 +167,7 @@ export function ScrollExperience() {
         {/* Cinematic Canvas rendering directly as Hero background */}
         <canvas
           ref={canvasRef}
-          className="absolute inset-0 w-full h-full object-cover z-0"
+          className="absolute inset-0 w-full h-full z-0"
         />
 
         {/* Cinematic Vignette Overlays */}
@@ -260,11 +189,11 @@ export function ScrollExperience() {
 
         {/* Initial Hero Title Overlay (fades out gracefully once user starts scrolling) */}
         <div
-          className={`absolute inset-0 z-20 flex flex-col items-center justify-center text-center px-4 pointer-events-none transition-all duration-700 ${
+          className={`absolute inset-0 z-20 flex flex-col items-center justify-center text-center px-4 pointer-events-none transition-[opacity,translate] duration-700 ${
             scrollStarted ? "opacity-0 -translate-y-8" : "opacity-100 translate-y-0"
           }`}
         >
-          <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 backdrop-blur-md mb-6">
+          <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full border border-amber-500/30 bg-[#050608]/70 mb-6">
             <Sparkles className="w-3.5 h-3.5 text-amber-400" />
             <span className="text-[11px] font-mono uppercase tracking-[0.25em] text-amber-200">
               The Pinnacle of Surface Restoration
@@ -292,7 +221,7 @@ export function ScrollExperience() {
 
         {/* HUD Elements / Stage Telemetry Overlay (fades in as user scrolls) */}
         <div
-          className={`relative z-20 w-full max-w-7xl mx-auto h-full px-6 sm:px-8 lg:px-12 flex flex-col justify-between py-24 sm:py-28 pointer-events-none transition-all duration-700 ${
+          className={`relative z-20 w-full max-w-7xl mx-auto h-full px-6 sm:px-8 lg:px-12 flex flex-col justify-between py-24 sm:py-28 pointer-events-none transition-[opacity,translate] duration-700 ${
             scrollStarted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-6"
           }`}
         >
@@ -300,7 +229,7 @@ export function ScrollExperience() {
           <div className="flex items-center justify-between pointer-events-auto">
             <div className="flex items-center gap-3">
               <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-              <span className="text-[11px] font-mono tracking-[0.25em] uppercase text-amber-300/90 bg-amber-500/10 px-3 py-1 rounded-full border border-amber-500/20 backdrop-blur-md">
+              <span className="text-[11px] font-mono tracking-[0.25em] uppercase text-amber-300/90 bg-[#050608]/70 px-3 py-1 rounded-full border border-amber-500/20">
                 {activeScene.tag}
               </span>
             </div>
@@ -342,7 +271,7 @@ export function ScrollExperience() {
 
             {/* Right: Technical Telemetry / Specifications */}
             <div className="lg:col-span-5">
-              <div className="glass-panel p-5 sm:p-6 rounded-lg space-y-3.5 backdrop-blur-xl bg-black/40 border border-white/10 shadow-2xl">
+              <div className="p-5 sm:p-6 rounded-lg space-y-3.5 bg-[#0a0e14]/80 border border-white/10 shadow-2xl">
                 <div className="flex items-center justify-between pb-2 border-b border-white/10">
                   <span className="text-[10px] font-mono uppercase tracking-widest text-amber-400 flex items-center gap-1.5">
                     <Compass className="w-3.5 h-3.5" />
