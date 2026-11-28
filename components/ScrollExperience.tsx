@@ -5,7 +5,7 @@ import gsap from "gsap";
 import { ScrollTrigger } from "gsap/ScrollTrigger";
 import { SCENES } from "@/data/scenes";
 import { createFrameStore } from "@/lib/frameStore";
-import { ChevronRight, Layers, Compass, Sparkles, ChevronDown } from "lucide-react";
+import { ChevronRight, Layers, Compass, Sparkles } from "lucide-react";
 
 if (typeof window !== "undefined") {
   gsap.registerPlugin(ScrollTrigger);

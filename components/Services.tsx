@@ -2,7 +2,7 @@
 
 import React from "react";
 import { DETAILING_PACKAGES } from "@/data/scenes";
-import { Check, Sparkles, Shield, Clock, ArrowRight } from "lucide-react";
+import { Check, Sparkles, Clock, ArrowRight } from "lucide-react";
 
 export function Services() {
   return (

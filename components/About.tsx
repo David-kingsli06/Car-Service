@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { ShieldAlert, Award, Microscope, Droplets, Gauge, Sparkles } from "lucide-react";
+import { Award, Microscope, Droplets, Gauge, Sparkles } from "lucide-react";
 
 export function About() {
   const pillars = [

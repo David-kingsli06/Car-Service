@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { ChevronDown, ShieldCheck, Sparkles, Award } from "lucide-react";
+import { ShieldCheck, Sparkles, Award } from "lucide-react";
 
 export function Hero() {
   return (
